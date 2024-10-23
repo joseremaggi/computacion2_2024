@@ -1,23 +1,28 @@
 import asyncio
 
-# Función para conectarse al servidor y enviar un mensaje
 async def tcp_client():
     reader, writer = await asyncio.open_connection('127.0.0.1', 8888)
 
-    # Mensaje que enviará el cliente
-    message = "¡Hola servidor!"
-    print(f"Enviando: {message}")
-    writer.write(message.encode())  # Enviar el mensaje al servidor
+    try:
+        while True:
+            data = await reader.read(1000)
+            if not data:
+                break
 
-    # Esperar la respuesta del servidor
-    data = await reader.read(100)
-    print(f"Recibido del servidor: {data.decode()}")
+            print(f'Pregunta recibida: {data.decode()}')
 
-    # Cerrar la conexión
-    print("Cerrando la conexión")
-    writer.close()
-    await writer.wait_closed()
+            respuesta = input('Ingresa tu respuesta (A/B/C/D): ').strip().upper()
+            writer.write(respuesta.encode())
+            await writer.drain()
 
-# Ejecutar el cliente
+            data = await reader.read(1000)
+            print(f'Resultado: {data.decode()}')
+
+    except ConnectionResetError:
+        print("Conexión cerrada por el servidor.")
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
 if __name__ == "__main__":
     asyncio.run(tcp_client())
