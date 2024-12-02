@@ -1,43 +1,28 @@
-import socket
+import asyncio
 
-def main():
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.connect(("127.0.0.1", 8888))
+async def tcp_client():
+    reader, writer = await asyncio.open_connection('127.0.0.1', 8888)
 
     try:
         while True:
-            # Esperar la pregunta del servidor
-            mensaje = client_socket.recv(1024).decode("utf-8").strip()
-
-            if mensaje == "FIN_JUEGO":
-                print("La partida ha terminado. Calculando resultados...")
+            data = await reader.read(1000)
+            if not data:
                 break
 
-            # Si el servidor indica error de confirmación, intentamos reenviar la confirmación
-            if mensaje == "ERROR_CONFIRMACION":
-                client_socket.sendall("RECIBIDO".encode("utf-8"))
-                continue
+            print(f'Pregunta recibida: {data.decode()}')
 
-            # Mostrar pregunta y enviar confirmación
-            print(mensaje)
-            client_socket.sendall("RECIBIDO".encode("utf-8"))
+            respuesta = input('Ingresa tu respuesta (A/B/C/D): ').strip().upper()
+            writer.write(respuesta.encode())
+            await writer.drain()
 
-            # Ingresar respuesta y enviarla al servidor
-            respuesta = input("Ingresa tu respuesta (A/B/C/D): ").strip().upper()
-            client_socket.sendall(respuesta.encode("utf-8"))
+            data = await reader.read(1000)
+            print(f'Resultado: {data.decode()}')
 
-            # Recibir retroalimentación (correcto/incorrecto)
-            feedback = client_socket.recv(1024).decode("utf-8").strip()
-            print(feedback)
-
-        # Recibir y mostrar los resultados finales
-        resultados = client_socket.recv(1024).decode("utf-8").strip()
-        print(resultados)
-
-    except ConnectionAbortedError:
+    except ConnectionResetError:
         print("Conexión cerrada por el servidor.")
     finally:
-        client_socket.close()
+        writer.close()
+        await writer.wait_closed()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(tcp_client())

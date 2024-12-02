@@ -1,151 +1,122 @@
-import argparse
-import socket
-import threading
-import multiprocessing
-import time
-import random
+import asyncio
 import json
+import random
 
-# Argumentos configurables por línea de comandos
-parser = argparse.ArgumentParser(description="Servidor de preguntas multihilo")
-parser.add_argument('--preguntas_por_ronda', type=int, default=2, help="Número de preguntas por ronda")
-parser.add_argument('--tiempo_espera', type=int, default=10, help="Tiempo de espera para que los jugadores se conecten")
-parser.add_argument('--jugadores', type=int, default=2, help="Número de jugadores en la partida")
-args = parser.parse_args()
+# Lista de clientes conectados
+clients = []
 
-NUMERO_PREGUNTAS_POR_RONDA = args.preguntas_por_ronda
-TIEMPO_ESPERA = args.tiempo_espera
-NUM_JUGADORES = args.jugadores
+# Diccionario para almacenar los puntos de los jugadores
+puntos_jugadores = {}
 
-# Cargar preguntas
-def cargar_preguntas():
-    with open("preguntas_pokemon.json", "r", encoding="utf-8") as file:
-        preguntas = json.load(file)
+# Semáforo para controlar acceso concurrente
+game_semaphore = asyncio.Semaphore()
+
+
+# Función para cargar preguntas desde un archivo JSON
+def cargar_preguntas_desde_archivo(archivo):
+    with open(archivo, 'r', encoding='utf-8') as f:
+        preguntas = json.load(f)
     return preguntas
 
-preguntas = cargar_preguntas()
 
-# Crear una barrera para sincronizar a los jugadores en cada ronda
-jugadores_listos = threading.Barrier(NUM_JUGADORES)
+# Cargar preguntas desde el archivo 'preguntas.json'
+preguntas = cargar_preguntas_desde_archivo('preguntas_pokemon.json')
 
-def handle_client(conn, addr, preguntas_ronda, puntuaciones, jugadores_listos):
+
+# Función para obtener una pregunta aleatoria
+def obtener_pregunta_aleatoria():
+    return random.choice(preguntas)
+
+
+# Función para manejar los clientes
+async def handle_client(reader, writer):
+    addr = writer.get_extra_info('peername')
     print(f"Jugador conectado: {addr}")
-    puntuaciones[addr] = 0  # Inicializar puntaje
+
+    # Inicializar puntos del jugador
+    async with game_semaphore:
+        puntos_jugadores[addr] = 0
+        clients.append((reader, writer))  # Añadir cliente a la lista de clientes conectados
 
     try:
-        for pregunta in preguntas_ronda:
-            # Esperar a que todos los jugadores estén listos para la nueva pregunta
-            jugadores_listos.wait()
+        while True:
+            await asyncio.sleep(9999)  # Mantener el cliente en espera hasta la próxima pregunta
 
-            # Enviar pregunta al cliente
-            conn.sendall(pregunta["texto"].encode("utf-8"))
-            print(f"Pregunta enviada a {addr}: {pregunta['texto']}")
-
-            # Esperar confirmación de recepción de pregunta
-            confirmacion = conn.recv(1024).decode("utf-8").strip()
-            if confirmacion != "RECIBIDO":
-                print(f"Error al recibir confirmación de {addr}.")
-                conn.sendall("ERROR_CONFIRMACION".encode("utf-8"))
-                continue
-
-            # Recibir respuesta del cliente
-            respuesta = conn.recv(1024).decode("utf-8").strip().upper()
-            print(f"Respuesta recibida de {addr}: {respuesta}")
-
-            # Evaluar respuesta y enviar feedback
-            if respuesta == pregunta["respuesta_correcta"]:
-                puntuaciones[addr] += 1
-                conn.sendall("¡Correcto!\n".encode("utf-8"))
-            else:
-                conn.sendall(f"Incorrecto. La respuesta correcta era: {pregunta['respuesta_correcta']}\n".encode("utf-8"))
-
-        # Esperar a que todos los jugadores terminen de responder todas las preguntas
-        jugadores_listos.wait()
-
-        # Enviar mensaje de finalización del juego a cada cliente
-        conn.sendall("FIN_JUEGO".encode("utf-8"))
-
-        # Crear y enviar el resumen de puntajes finales
-        resultados = "\nResultados finales:\n"
-        for jugador, puntaje in puntuaciones.items():
-            resultados += f"{jugador[0]}: {puntaje} puntos\n"
-
-        # Determinar el ganador
-        max_puntaje = max(puntuaciones.values())
-        ganadores = [jugador[0] for jugador, puntaje in puntuaciones.items() if puntaje == max_puntaje]
-        if len(ganadores) == 1:
-            resultados += f"Ganador: {ganadores[0]} con {max_puntaje} puntos.\n"
-        else:
-            resultados += f"Empate entre: {', '.join(ganadores)} con {max_puntaje} puntos.\n"
-
-        # Enviar los resultados finales al cliente
-        conn.sendall(resultados.encode("utf-8"))
-
-    except (ConnectionResetError, threading.BrokenBarrierError):
+    except ConnectionResetError:
+        pass
+    finally:
         print(f"Jugador desconectado: {addr}")
-    finally:
-        conn.close()
+        clients.remove((reader, writer))  # Remover cliente desconectado
+        writer.close()
+        await writer.wait_closed()
 
 
-# Generar preguntas para la ronda actual
-def preparar_preguntas():
-    preguntas_ronda = random.sample(preguntas, NUMERO_PREGUNTAS_POR_RONDA)
-    return [
-        {
-            "texto": (
+# Función para enviar la misma pregunta a todos los clientes
+async def broadcast_pregunta():
+    while True:
+        if clients:  # Verifica si hay clientes conectados
+            pregunta = obtener_pregunta_aleatoria()
+            pregunta_texto = (
                 f"{pregunta['pregunta']}\nA) {pregunta['opciones']['A']}\nB) {pregunta['opciones']['B']}\n"
-                f"C) {pregunta['opciones']['C']}\nD) {pregunta['opciones']['D']}\n"
-            ),
-            "respuesta_correcta": pregunta["respuesta_correcta"]
-        }
-        for pregunta in preguntas_ronda
-    ]
+                f"C) {pregunta['opciones']['C']}\nD) {pregunta['opciones']['D']}\n")
+
+            # Enviar la pregunta a todos los clientes conectados
+            for _, writer in clients:
+                writer.write(pregunta_texto.encode())
+                await writer.drain()
+
+            # Recibir respuestas de todos los clientes
+            respuestas = await obtener_respuestas(pregunta['respuesta_correcta'])
+
+            # Enviar resultados a todos los clientes
+            for addr, (status, reader, writer) in respuestas.items():
+                if status == "correcta":
+                    async with game_semaphore:
+                        puntos_jugadores[addr] += 1
+                    mensaje = f"¡Correcto! Tienes {puntos_jugadores[addr]} puntos.\n"
+                else:
+                    mensaje = f"Incorrecto. La respuesta correcta era {pregunta['respuesta_correcta']}. Tienes {puntos_jugadores[addr]} puntos.\n"
+
+                writer.write(mensaje.encode())
+                await writer.drain()
+
+        await asyncio.sleep(10)  # Intervalo entre preguntas
 
 
-# Mostrar puntajes finales en el servidor
-def mostrar_puntajes(puntuaciones):
-    print("\nPuntajes finales:")
-    for addr, puntos in puntuaciones.items():
-        print(f"Jugador {addr}: {puntos} puntos")
+# Función para recibir respuestas de todos los clientes
+async def obtener_respuestas(respuesta_correcta):
+    respuestas = {}
 
-# Servidor principal
-def main():
-    manager = multiprocessing.Manager()
-    puntuaciones = manager.dict()
+    for reader, writer in clients:
+        try:
+            data = await reader.read(100)
+            respuesta = data.decode().strip().upper()
 
-    # Crear socket servidor
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind(("0.0.0.0", 8888))
-    server_socket.listen()
-    print("Servidor iniciado y esperando jugadores...")
+            addr = writer.get_extra_info('peername')
+            if respuesta == respuesta_correcta:
+                respuestas[addr] = ("correcta", reader, writer)
+            else:
+                respuestas[addr] = ("incorrecta", reader, writer)
 
-    # Generar las preguntas de la ronda
-    preguntas_ronda = preparar_preguntas()
+        except ConnectionResetError:
+            pass
 
-    # Esperar tiempo antes de comenzar la ronda para dar tiempo a que los jugadores se conecten
-    print(f"Esperando {TIEMPO_ESPERA} segundos antes de comenzar la ronda...")
-    time.sleep(TIEMPO_ESPERA)
+    return respuestas
 
-    # Lista para almacenar hilos de jugadores
-    jugadores_threads = []
 
-    # Aceptar conexiones de jugadores y comenzar el juego
-    try:
-        for _ in range(NUM_JUGADORES):
-            conn, addr = server_socket.accept()
-            cliente_thread = threading.Thread(target=handle_client, args=(conn, addr, preguntas_ronda, puntuaciones, jugadores_listos))
-            cliente_thread.start()
-            jugadores_threads.append(cliente_thread)
+# Función principal del servidor
+async def main():
+    server = await asyncio.start_server(handle_client, '127.0.0.1', 8888)
+    addr = server.sockets[0].getsockname()
+    print(f"Servidor corriendo en {addr}")
 
-        # Esperar a que terminen todos los jugadores
-        for thread in jugadores_threads:
-            thread.join()
+    # Correr la tarea de broadcasting en paralelo
+    await asyncio.gather(server.serve_forever(), broadcast_pregunta())
 
-    except KeyboardInterrupt:
-        print("Servidor detenido.")
-    finally:
-        mostrar_puntajes(puntuaciones)
-        server_socket.close()
 
+# Ejecutar el servidor
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Servidor detenido")
